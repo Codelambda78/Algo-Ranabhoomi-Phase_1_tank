@@ -4,12 +4,32 @@ import random
 import time
 
 from adapter import Solver, route_load, total_length
-from adapters.baseline import BaselineSolver, two_opt
+from adapters.baseline import BaselineSolver
 from adapters.starter import StarterSolver
 from data import distance_matrix
 
 
 SAFETY_S = 0.2
+
+
+def best_two_opt(d, route):
+    """Reverse the most cost-saving segment until no improving reversal remains."""
+    while True:
+        best_delta = 0
+        best_pair = None
+        for start in range(len(route) - 1):
+            left = route[start - 1] if start else 0
+            for end in range(start + 1, len(route)):
+                right = route[end + 1] if end + 1 < len(route) else 0
+                delta = (d[left][route[end]] + d[route[start]][right]
+                         - d[left][route[start]] - d[route[end]][right])
+                if delta < best_delta:
+                    best_delta = delta
+                    best_pair = (start, end)
+        if best_pair is None:
+            return route
+        start, end = best_pair
+        route[start:end + 1] = reversed(route[start:end + 1])
 
 
 def best_relocate_once(d, instance, routes, loads):
@@ -172,23 +192,39 @@ def best_tail_exchange_once(d, instance, routes, loads):
 
                     second_previous = second_route[second_cut - 1] if second_cut else 0
                     second_suffix_start = second_route[second_cut] if second_cut < len(second_route) else 0
-                    delta = (
-                        d[first_previous][second_suffix_start] + d[second_previous][first_suffix_start]
-                        - d[first_previous][first_suffix_start] - d[second_previous][second_suffix_start]
-                    )
-                    if delta < best_delta:
-                        best_delta = delta
-                        best_move = (first_route_index, first_cut, second_route_index, second_cut,
-                                     new_first_load, new_second_load)
+                    first_tail = first_route[first_cut:]
+                    second_tail = second_route[second_cut:]
+                    first_tail_start = first_tail[0] if first_tail else 0
+                    first_tail_end = first_tail[-1] if first_tail else 0
+                    second_tail_start = second_tail[0] if second_tail else 0
+                    second_tail_end = second_tail[-1] if second_tail else 0
+
+                    for reverse_first, reverse_second in ((False, False), (True, False),
+                                                           (False, True), (True, True)):
+                        new_first_start = second_tail_end if reverse_second else second_tail_start
+                        new_first_end = second_tail_start if reverse_second else second_tail_end
+                        new_second_start = first_tail_end if reverse_first else first_tail_start
+                        new_second_end = first_tail_start if reverse_first else first_tail_end
+                        delta = (
+                            d[first_previous][new_first_start] + d[new_first_end][0]
+                            + d[second_previous][new_second_start] + d[new_second_end][0]
+                            - d[first_previous][first_tail_start] - d[first_tail_end][0]
+                            - d[second_previous][second_tail_start] - d[second_tail_end][0]
+                        )
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_move = (first_route_index, first_cut, second_route_index, second_cut,
+                                         new_first_load, new_second_load, reverse_first, reverse_second)
 
     if best_move is None:
         return None
 
-    first_route_index, first_cut, second_route_index, second_cut, first_load, second_load = best_move
+    (first_route_index, first_cut, second_route_index, second_cut, first_load, second_load,
+     reverse_first, reverse_second) = best_move
     first_tail = routes[first_route_index][first_cut:]
     second_tail = routes[second_route_index][second_cut:]
-    routes[first_route_index][first_cut:] = second_tail
-    routes[second_route_index][second_cut:] = first_tail
+    routes[first_route_index][first_cut:] = second_tail[::-1] if reverse_second else second_tail
+    routes[second_route_index][second_cut:] = first_tail[::-1] if reverse_first else first_tail
     loads[first_route_index] = first_load
     loads[second_route_index] = second_load
     return first_route_index, second_route_index
@@ -221,6 +257,56 @@ def randomized_routes(instance, d, rng):
             return None
 
     return routes
+
+
+def savings_routes(instance, d, rng):
+    """Construct capacity-feasible routes by merging endpoints with high savings."""
+    routes = {v: [v] for v in range(1, instance.size + 1)}
+    loads = {v: instance.demand[v] for v in range(1, instance.size + 1)}
+    owner = list(range(instance.size + 1))
+    pairs = [
+        (d[0][first] + d[0][second] - d[first][second], rng.random(), first, second)
+        for first in range(1, instance.size + 1)
+        for second in range(first + 1, instance.size + 1)
+    ]
+    pairs.sort(reverse=True)
+    route_count = instance.size
+    next_route_id = instance.size + 1
+
+    for saving, _, first, second in pairs:
+        if route_count <= instance.fleet and saving <= 0:
+            break
+        first_id = owner[first]
+        second_id = owner[second]
+        if first_id == second_id:
+            continue
+        first_route = routes[first_id]
+        second_route = routes[second_id]
+        if first not in (first_route[0], first_route[-1]) or second not in (second_route[0], second_route[-1]):
+            continue
+        combined_load = loads[first_id] + loads[second_id]
+        if combined_load > instance.capacity:
+            continue
+
+        if first == first_route[0]:
+            first_route.reverse()
+        if second == second_route[-1]:
+            second_route.reverse()
+        merged = first_route + second_route
+        del routes[first_id]
+        del routes[second_id]
+        del loads[first_id]
+        del loads[second_id]
+        routes[next_route_id] = merged
+        loads[next_route_id] = combined_load
+        for village in merged:
+            owner[village] = next_route_id
+        next_route_id += 1
+        route_count -= 1
+
+    if route_count > instance.fleet:
+        return None
+    return list(routes.values())
 
 
 def perturb_routes(instance, d, routes, rng):
@@ -265,12 +351,13 @@ def perturb_routes(instance, d, routes, rng):
     return candidate
 
 
-def improve_routes(d, instance, routes, deadline):
+def improve_routes(d, instance, routes, deadline, consider):
     """Descend through improving relocations, swaps, tail exchanges and 2-opt."""
     for route in routes:
         if time.monotonic() >= deadline:
             return routes
-        two_opt(d, route)
+        best_two_opt(d, route)
+    consider(routes)
 
     loads = [route_load(instance, route) for route in routes]
     while time.monotonic() < deadline:
@@ -284,7 +371,8 @@ def improve_routes(d, instance, routes, deadline):
         if changed_routes is None:
             break
         for route_index in changed_routes:
-            two_opt(d, routes[route_index])
+            best_two_opt(d, routes[route_index])
+        consider(routes)
     return routes
 
 
@@ -293,7 +381,7 @@ class MySolver(Solver):
         d = distance_matrix(instance)
         routes = StarterSolver().solve(instance, submit_candidate)["routes"]
         for route in routes:
-            two_opt(d, route)
+            best_two_opt(d, route)
         receipt = submit_candidate({"routes": routes})
         loads = [route_load(instance, route) for route in routes]
         while receipt["remaining_s"] > SAFETY_S:
@@ -307,7 +395,7 @@ class MySolver(Solver):
             if changed_routes is None:
                 break
             for route_index in changed_routes:
-                two_opt(d, routes[route_index])
+                best_two_opt(d, routes[route_index])
             receipt = submit_candidate({"routes": routes})
 
         best_routes = [route[:] for route in routes]
@@ -326,19 +414,29 @@ class MySolver(Solver):
 
         BaselineSolver().solve(instance, submit_baseline_candidate)
 
+        def consider(candidate_routes):
+            nonlocal best_routes, best_cost
+            candidate_cost = total_length(instance, candidate_routes)
+            if candidate_cost < best_cost:
+                best_cost = candidate_cost
+                best_routes = [route[:] for route in candidate_routes]
+                receipts[0] = submit_candidate({"routes": best_routes})
+            return receipts[0]
+
         rng = random.Random(int(instance.digest, 16))
         while receipts[0]["remaining_s"] > SAFETY_S:
-            if rng.random() < 0.65:
+            choice = rng.random()
+            if choice < 0.55:
                 candidate_routes = perturb_routes(instance, d, best_routes, rng)
+            elif choice < 0.8:
+                candidate_routes = savings_routes(instance, d, rng)
             else:
                 candidate_routes = randomized_routes(instance, d, rng)
             if candidate_routes is not None:
-                deadline = time.monotonic() + receipts[0]["remaining_s"] - SAFETY_S
-                improve_routes(d, instance, candidate_routes, deadline)
-                candidate_cost = total_length(instance, candidate_routes)
-                if candidate_cost < best_cost:
-                    best_cost = candidate_cost
-                    best_routes = [route[:] for route in candidate_routes]
+                slice_s = 0.35 if instance.size <= 60 else 0.65
+                deadline = time.monotonic() + min(
+                    slice_s, receipts[0]["remaining_s"] - SAFETY_S)
+                improve_routes(d, instance, candidate_routes, deadline, consider)
             receipts[0] = submit_candidate({"routes": best_routes})
 
         return {"routes": [route for route in best_routes if route]}
